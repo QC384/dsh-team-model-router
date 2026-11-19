@@ -1,7 +1,7 @@
 {
   "name": "dsh-team-model-router",
-  "version": "0.2.0",
-  "description": "Per-member default routes AND per-task model switching for DSH Agent Teams, without re-creating teammates.",
+  "version": "0.3.0",
+  "description": "Per-task model switching plus /team-model command and settings card for DSH Agent Teams.",
   "type": "module",
   "main": "index.js",
   "exports": {
