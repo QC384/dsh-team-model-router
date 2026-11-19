@@ -1,7 +1,7 @@
 /**
  * dsh-team-model-router
  *
- * Two layers of model routing for DSH Agent Teams:
+ * Three surfaces over one routing core:
  *
  * 1. **Per-member default route** at spawn time. `spawn_teammate` carries no
  *    model, but `ctx.subagents.startContinuable` accepts `agentOptions`; the
@@ -11,12 +11,16 @@
  *    prompt assembly snapshots `ref.current`, so setting it before the member's
  *    next turn changes that one task's model without re-creating the member.
  *    The ref is cleared again at that turn's `turn/end`.
+ * 3. **Human surfaces**: a `/team-model` command rendered by the UI command
+ *    plane (never enters model history) and a `team-model-router` settings
+ *    namespace rendered as a configuration card.
  *
  * @module dsh-team-model-router
  */
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
+import { COMMAND_NAME, parseTeamCommand, renderCommandHelp } from './lib/command.js'
 import { createOverrideBook } from './lib/overrides.js'
 import { createPendingRoutes } from './lib/pending.js'
 import { installRouteInterception } from './lib/patch.js'
@@ -25,6 +29,7 @@ import {
   describeRoute,
   matchRule,
   normalizeRoute,
+  normalizeState,
   resolveRoute,
   routeState,
 } from './lib/rules.js'
@@ -32,7 +37,7 @@ import { readRules, rulesPath, writeRules } from './lib/store.js'
 
 export const name = 'dsh-team-model-router'
 
-/** `subagents` is hard; `agentTeams` / `agents` are probed with `ctx.get`. */
+/** `subagents` is hard; `agentTeams` / `agents` / `commands` / `settings` are probed. */
 export const inject = ['tools', 'subagents']
 
 export const Config = z.object({
@@ -41,6 +46,14 @@ export const Config = z.object({
   defaultModel: z.string(),
   members: z.dict(z.object({ provider: z.string().required(), model: z.string().required() })),
 })
+
+/** Shape rendered by the settings surface; every field is optional. */
+const SettingsSchema = z.object({
+  defaults: z.object({ provider: z.string(), model: z.string() }),
+  members: z.dict(z.object({ provider: z.string(), model: z.string() })),
+})
+
+export const SETTINGS_NAMESPACE = 'team-model-router'
 
 /**
  * @param {string | undefined} provider
@@ -55,10 +68,18 @@ function currentRoute(provider, model) {
 
 /**
  * @param {any} agent
- * @returns {{ provider: string, model: string } | null}
  */
 function leaderRouteOf(agent) {
   return currentRoute(agent?.options?.provider, agent?.options?.model)
+}
+
+/**
+ * @param {any} agent
+ * @param {any} teams
+ */
+function isLead(agent, teams) {
+  const membership = typeof teams?.tryMembership === 'function' ? teams.tryMembership(agent) : undefined
+  return membership === undefined || membership === null || membership.role === 'lead'
 }
 
 /**
@@ -68,23 +89,34 @@ function leaderRouteOf(agent) {
 function requireLead(exec, teams) {
   const agent = exec?.agent
   if (agent === undefined || agent === null) throw new Error('this tool must be called by a live agent')
-  const membership = typeof teams?.tryMembership === 'function' ? teams.tryMembership(agent) : undefined
-  if (membership !== undefined && membership !== null && membership.role !== 'lead') {
-    throw new Error('only the Team Lead can change member model routes')
-  }
+  if (!isLead(agent, teams)) throw new Error('only the Team Lead can change member model routes')
   return agent
 }
 
 /**
  * @param {Record<string, unknown>} config
+ */
+function configBaseOf(config) {
+  /** @type {Record<string, unknown>} */
+  const base = {}
+  if (typeof config.defaultProvider === 'string' && typeof config.defaultModel === 'string') {
+    base.defaults = { provider: config.defaultProvider, model: config.defaultModel }
+  }
+  const members = /** @type {Record<string, { provider: string, model: string }> | undefined} */ (config.members)
+  if (members !== undefined && members !== null) {
+    base.members = Object.fromEntries(Object.entries(members).map(([member, value]) => [member, { provider: value.provider, model: value.model }]))
+  }
+  return base
+}
+
+/**
+ * @param {Record<string, unknown>} config
  * @param {string} path
- * @returns {Promise<{ state: import('./lib/rules.js').RuleState, diagnostics: string[] }>}
  */
 async function loadState(config, path) {
   const loaded = await readRules(path)
   const diagnostics = [...loaded.diagnostics]
   const state = loaded.state
-  // Config is the baseline; a file written by a previous tool call wins.
   if (typeof config.defaultProvider === 'string' && typeof config.defaultModel === 'string') {
     const normalized = normalizeRoute({ provider: config.defaultProvider, model: config.defaultModel }, 'config')
     diagnostics.push(...normalized.diagnostics)
@@ -103,7 +135,6 @@ async function loadState(config, path) {
  * @param {any} teams
  * @param {any} leader
  * @param {string} name
- * @returns {{ id: string, name: string, status: string } | null}
  */
 function findMemberRow(teams, leader, name) {
   if (typeof teams?.listMembers !== 'function') return null
@@ -123,7 +154,16 @@ function describeOverride(override) {
 }
 
 /**
- * Render the roster with rule/effective/observed/override columns.
+ * @param {import('./lib/rules.js').RuleState} state
+ */
+function sectionOf(state) {
+  return {
+    ...(state.defaults === null ? {} : { defaults: { ...state.defaults } }),
+    members: Object.fromEntries(Object.entries(state.members).map(([member, route]) => [member, { ...route }])),
+  }
+}
+
+/**
  * @param {any} agent
  * @param {any} teams
  * @param {import('./lib/rules.js').RuleState} state
@@ -185,7 +225,60 @@ export async function apply(ctx, config = {}) {
   /** @type {Map<string, { selection: any, scope: 'next-turn' | 'sticky' }>} */
   const pendingByName = new Map()
   const diagnostics = []
-  const { state } = await loadState(config, path)
+
+  let state
+  let settingsScope = null
+
+  const loaded = await loadState(config, path)
+  state = loaded.state
+  diagnostics.push(...loaded.diagnostics)
+
+  // Settings are the canonical long-term store when the host mounts them;
+  // rules.json stays the fallback and is imported once.
+  const settings = ctx.get('settings')
+  if (typeof settings?.register === 'function') {
+    try {
+      settingsScope = settings.register(SETTINGS_NAMESPACE, SettingsSchema, {
+        base: configBaseOf(config),
+        applies: 'live',
+      })
+      const resolved = normalizeState(settingsScope.get())
+      const emptySettings = resolved.state.defaults === null && Object.keys(resolved.state.members).length === 0
+      const fileHasRules = state.defaults !== null || Object.keys(state.members).length > 0
+      diagnostics.push(...resolved.diagnostics)
+      if (emptySettings && fileHasRules) {
+        await settingsScope.replace(sectionOf(state))
+      } else {
+        state = resolved.state
+      }
+      ctx.effect(() => settingsScope.watch((next) => {
+        const normalized = normalizeState(next)
+        state = normalized.state
+      }), 'team-model-router: settings')
+    } catch (error) {
+      settingsScope = null
+      diagnostics.push(`settings namespace "${SETTINGS_NAMESPACE}" unavailable: ${String(error)}`)
+    }
+  }
+
+  async function persist() {
+    if (settingsScope !== null) {
+      await settingsScope.replace(sectionOf(state))
+      return
+    }
+    await writeRules(path, state)
+  }
+
+  async function reloadState() {
+    if (settingsScope !== null) {
+      const normalized = normalizeState(settingsScope.get())
+      state = normalized.state
+      return normalized.diagnostics
+    }
+    const reloaded = await loadState(config, path)
+    state = reloaded.state
+    return reloaded.diagnostics
+  }
 
   const resolve = (/** @type {{ parentId: string, label: string, name: string }} */ target) => {
     const byName = target.name === '' ? null : resolveRoute(state, { name: target.name }).route
@@ -193,7 +286,7 @@ export async function apply(ctx, config = {}) {
     return resolveRoute(state, { name: target.label }).route
   }
 
-  if (state.defaults !== null || Object.keys(state.members).length > 0) {
+  if (settingsScope === null && (state.defaults !== null || Object.keys(state.members).length > 0)) {
     await writeRules(path, state)
   }
 
@@ -238,8 +331,6 @@ export async function apply(ctx, config = {}) {
     return true
   }
 
-  // Turn boundaries: apply the queued route at turn start, revert after a
-  // one-task override closes.
   ctx.effect(() => ctx.on('session/event', (/** @type {any} */ session, /** @type {any} */ event) => {
     const id = String(session?.id ?? '')
     if (id === '' || !book.has(id)) return
@@ -253,7 +344,6 @@ export async function apply(ctx, config = {}) {
     }
   }), 'team-model-router: turn-scoped selection')
 
-  // A cold-resumed teammate is a new Agent; its queued entry is keyed by name.
   ctx.effect(() => ctx.on('agent/created', (/** @type {any} */ payload) => {
     const agent = payload?.agent
     const membership = typeof teams?.tryMembership === 'function' ? teams.tryMembership(agent) : undefined
@@ -263,6 +353,77 @@ export async function apply(ctx, config = {}) {
     pendingByName.delete(membership.name)
     book.request(String(agent.id), queued.selection, queued.scope)
   }), 'team-model-router: resume hand-off')
+
+  /**
+   * @param {any} leader
+   * @param {string} member
+   * @param {{ provider: string, model: string, reasoningEffort?: string }} selection
+   * @param {'next-turn' | 'sticky'} scope
+   */
+  async function setNextModel(leader, member, selection, scope) {
+    if (member === '') throw new Error('member is required')
+    const row = findMemberRow(teams, leader, member)
+    if (row === null) {
+      if (teams === undefined || teams === null) {
+        pendingByName.set(member, { selection, scope })
+        return `Agent Teams unavailable; queued ${selection.provider}/${selection.model} for "${member}".`
+      }
+      throw new Error(`unknown teammate "${member}"; call team_model_list for the exact roster names`)
+    }
+    const agents = ctx.get('agents')
+    const live = typeof agents?.get === 'function' ? agents.get(row.id) : undefined
+    if (live === undefined || live === null) {
+      pendingByName.set(member, { selection, scope })
+      return `"${member}" is ${row.status}; queued ${selection.provider}/${selection.model} for its next activation.`
+    }
+    book.request(row.id, selection, scope)
+    ensureSlot(live)
+    const running = String(live.status) === 'running'
+    return [
+      `"${member}" next task -> ${selection.provider}/${selection.model}${selection.reasoningEffort === undefined ? '' : ` (effort ${selection.reasoningEffort})`}`,
+      `scope=${scope}; ${running ? 'member is running, so the switch lands on the following turn' : 'applies when the next turn starts'}`,
+      'a one-task override reverts to the member\'s own route at that turn\'s end',
+    ].join('\n')
+  }
+
+  /**
+   * @param {any} leader
+   * @param {string} member
+   */
+  function clearNextModel(leader, member) {
+    if (member === '') throw new Error('member is required')
+    pendingByName.delete(member)
+    const row = findMemberRow(teams, leader, member)
+    if (row !== null) {
+      book.clear(row.id)
+      applySelection(row.id, undefined)
+    }
+    return `cleared next-task override for "${member}"`
+  }
+
+  /**
+   * @param {string} member
+   * @param {{ provider: string, model: string }} route
+   */
+  async function setDefaultRoute(member, route) {
+    if (member === ALL_MEMBERS) state.defaults = route
+    else state.members[member] = route
+    await persist()
+  }
+
+  /**
+   * @param {string} member
+   */
+  async function clearDefaultRoute(member) {
+    if (member === 'all') {
+      state = { version: state.version, defaults: null, members: {} }
+    } else if (member === ALL_MEMBERS) {
+      state.defaults = null
+    } else {
+      delete state.members[member]
+    }
+    await persist()
+  }
 
   /** @type {Array<() => void>} */
   const toolDisposers = []
@@ -288,9 +449,7 @@ export async function apply(ctx, config = {}) {
       const member = String(args.member ?? '').trim()
       const normalized = normalizeRoute({ provider: args.provider, model: args.model }, 'arguments')
       if (normalized.route === null) throw new Error(`invalid route: ${normalized.diagnostics.join('; ') || 'provider and model are required'}`)
-      if (member === ALL_MEMBERS) state.defaults = normalized.route
-      else state.members[member] = normalized.route
-      await writeRules(path, state)
+      await setDefaultRoute(member, normalized.route)
       return [
         `${member === ALL_MEMBERS ? 'default route' : `member "${member}"`}: ${normalized.route.provider}/${normalized.route.model} saved`,
         `leader route: ${describeRoute(leaderRouteOf(agent))}`,
@@ -321,7 +480,6 @@ export async function apply(ctx, config = {}) {
     async execute(/** @type {any} */ args, /** @type {any} */ exec) {
       const leader = requireLead(exec, teams)
       const member = String(args.member ?? '').trim()
-      if (member === '') throw new Error('member is required')
       const normalized = normalizeRoute({ provider: args.provider, model: args.model }, 'arguments')
       if (normalized.route === null) throw new Error(`invalid route: ${normalized.diagnostics.join('; ') || 'provider and model are required'}`)
       const scope = args.scope === 'sticky' ? 'sticky' : 'next-turn'
@@ -332,28 +490,7 @@ export async function apply(ctx, config = {}) {
           ? { reasoningEffort: args.reasoning_effort.trim() }
           : {}),
       }
-      const row = findMemberRow(teams, leader, member)
-      if (row === null) {
-        if (teams === undefined || teams === null) {
-          pendingByName.set(member, { selection, scope })
-          return `Agent Teams unavailable; queued ${selection.provider}/${selection.model} for "${member}".`
-        }
-        throw new Error(`unknown teammate "${member}"; call team_model_list for the exact roster names`)
-      }
-      const agents = ctx.get('agents')
-      const live = typeof agents?.get === 'function' ? agents.get(row.id) : undefined
-      if (live === undefined || live === null) {
-        pendingByName.set(member, { selection, scope })
-        return `"${member}" is ${row.status}; queued ${selection.provider}/${selection.model} for its next activation.`
-      }
-      book.request(row.id, selection, scope)
-      ensureSlot(live)
-      const running = String(live.status) === 'running'
-      return [
-        `"${member}" next task -> ${selection.provider}/${selection.model}${selection.reasoningEffort === undefined ? '' : ` (effort ${selection.reasoningEffort})`}`,
-        `scope=${scope}; ${running ? 'member is running, so the switch lands on the following turn' : 'applies when the next turn starts'}`,
-        'a one-task override reverts to the member\'s own route at that turn\'s end',
-      ].join('\n')
+      return setNextModel(leader, member, selection, scope)
     },
   })
 
@@ -366,15 +503,7 @@ export async function apply(ctx, config = {}) {
     output: { schema: { type: 'string' } },
     async execute(/** @type {any} */ args, /** @type {any} */ exec) {
       const leader = requireLead(exec, teams)
-      const member = String(args.member ?? '').trim()
-      if (member === '') throw new Error('member is required')
-      pendingByName.delete(member)
-      const row = findMemberRow(teams, leader, member)
-      if (row !== null) {
-        book.clear(row.id)
-        applySelection(row.id, undefined)
-      }
-      return `cleared next-task override for "${member}"`
+      return clearNextModel(leader, String(args.member ?? '').trim())
     },
   })
 
@@ -388,15 +517,7 @@ export async function apply(ctx, config = {}) {
     async execute(/** @type {any} */ args, /** @type {any} */ exec) {
       const agent = requireLead(exec, teams)
       const member = String(args.member ?? '').trim()
-      if (member === 'all') {
-        state.members = {}
-        state.defaults = null
-      } else if (member === ALL_MEMBERS) {
-        state.defaults = null
-      } else {
-        delete state.members[member]
-      }
-      await writeRules(path, state)
+      await clearDefaultRoute(member)
       return `cleared ${member}; leader route stays ${describeRoute(leaderRouteOf(agent))}`
     },
   })
@@ -410,10 +531,8 @@ export async function apply(ctx, config = {}) {
     output: { schema: { type: 'string' } },
     async execute(/** @type {any} */ _args, /** @type {any} */ exec) {
       const agent = requireLead(exec, teams)
-      const reloaded = await loadState(config, path)
-      state.defaults = reloaded.state.defaults
-      state.members = reloaded.state.members
-      return renderRoster(agent, teams, state, path, [...reloaded.diagnostics, ...diagnostics], { book, pendingByName })
+      const reloaded = await reloadState()
+      return renderRoster(agent, teams, state, path, [...reloaded, ...diagnostics], { book, pendingByName })
     },
   })
 
@@ -424,12 +543,59 @@ export async function apply(ctx, config = {}) {
     output: { schema: { type: 'string' } },
     async execute(/** @type {any} */ _args, /** @type {any} */ exec) {
       const agent = requireLead(exec, teams)
-      const reloaded = await loadState(config, path)
-      state.defaults = reloaded.state.defaults
-      state.members = reloaded.state.members
-      return renderRoster(agent, teams, state, path, reloaded.diagnostics, { book, pendingByName })
+      const reloaded = await reloadState()
+      return renderRoster(agent, teams, state, path, [...reloaded, ...diagnostics], { book, pendingByName })
     },
   })
+
+  // --- human command plane ------------------------------------------------
+  const commands = ctx.get('commands')
+  if (typeof commands?.register === 'function') {
+    ctx.effect(() => commands.register({
+      name: COMMAND_NAME,
+      description: 'Set one teammate\'s model for its next task in this conversation, or manage member default routes.',
+      input: { hint: 'coder deepseek deepseek-v4 | coder sticky qwen qwen3-coder | coder clear | status' },
+      handler: async (/** @type {any} */ invocation) => {
+        const agent = invocation.agent
+        if (!isLead(agent, teams)) {
+          return { kind: 'error', text: '只有 Team Lead 可以修改成员模型路由' }
+        }
+        const parsed = parseTeamCommand(invocation.rawInput)
+        try {
+          switch (parsed.kind) {
+            case 'status':
+              return { kind: 'success', text: renderRoster(agent, teams, state, path, diagnostics, { book, pendingByName }) }
+            case 'help':
+              return { kind: 'success', text: renderCommandHelp() }
+            case 'set': {
+              const normalized = normalizeRoute({ provider: parsed.provider, model: parsed.model }, 'command')
+              if (normalized.route === null) throw new Error(normalized.diagnostics.join('; ') || 'provider and model are required')
+              const selection = {
+                ...normalized.route,
+                ...(parsed.effort === undefined ? {} : { reasoningEffort: parsed.effort }),
+              }
+              return { kind: 'success', text: await setNextModel(agent, parsed.member, selection, parsed.scope) }
+            }
+            case 'clear':
+              return { kind: 'success', text: clearNextModel(agent, parsed.member) }
+            case 'set-default': {
+              const normalized = normalizeRoute({ provider: parsed.provider, model: parsed.model }, 'command')
+              if (normalized.route === null) throw new Error(normalized.diagnostics.join('; ') || 'provider and model are required')
+              await setDefaultRoute(parsed.member, normalized.route)
+              return { kind: 'success', text: `默认路由已保存：${parsed.member} => ${normalized.route.provider}/${normalized.route.model}（需重建成员生效）` }
+            }
+            case 'clear-default':
+              await clearDefaultRoute(parsed.member)
+              return { kind: 'success', text: `已清除默认路由：${parsed.member}` }
+            default:
+              return { kind: 'error', text: parsed.text ?? '无法解析该命令' }
+          }
+        } catch (error) {
+          return { kind: 'error', text: String(/** @type {any} */ (error)?.message ?? error) }
+        }
+      },
+    }), 'team-model-router: command')
+  }
 
   ctx.effect(() => () => {
     for (const dispose of toolDisposers.splice(0)) dispose()
