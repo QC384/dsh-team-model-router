@@ -198,8 +198,6 @@ npm test        # 31 passed
 
 另外做过一次桩集成冒烟（`installModelSelection` + `session/event` + `agent/created` 全部打桩）：6 个工具注册、turn/start 设值、turn/end 还原、running 排队、inactive 冷恢复、roster 显示 override、非 Lead 拒绝，全部通过。
 
-还验证了 UI 两面：斜杠指令注册与执行、设置命名空间注册、设置页写入回灌到路由、旧 `rules.json` 自动导入、无 `settings` 时回落文件。
-
 ## 10. 限制（诚实版）
 
 1. **不能改"当前正在跑"的那一轮**。宿主的组装是快照式的；插件能做的是排到下一轮，不会中途劈开模型。
