@@ -56,6 +56,12 @@ test('glob patterns match and are case-insensitive', () => {
   assert.equal(matchRule(state, 'coder'), null)
 })
 
+test('? matches exactly one character', () => {
+  const state = normalizeState({ members: { 'a?c': { provider: 'p', model: 'm' } } }).state
+  assert.equal(matchRule(state, 'abc').name, 'a?c')
+  assert.equal(matchRule(state, 'abbc'), null)
+})
+
 test('resolveRoute prefers member rule, then default, then inherit', () => {
   const state = normalizeState({
     defaults: { provider: 'p', model: 'default' },
