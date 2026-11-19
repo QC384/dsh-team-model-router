@@ -21,8 +21,12 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import { COMMAND_NAME, parseTeamCommand, renderCommandHelp } from './lib/command.js'
+import { normalizeAliases, resolveToken } from './lib/aliases.js'
+import { createAuditLog } from './lib/audit.js'
+import { createCatalog } from './lib/catalog.js'
 import { createOverrideBook } from './lib/overrides.js'
 import { createPendingRoutes } from './lib/pending.js'
+import { createSessionStore } from './lib/session-store.js'
 import { installRouteInterception } from './lib/patch.js'
 import {
   ALL_MEMBERS,
@@ -34,6 +38,7 @@ import {
   routeState,
 } from './lib/rules.js'
 import { readRules, rulesPath, writeRules } from './lib/store.js'
+import { dirname, join } from 'node:path'
 
 export const name = 'dsh-team-model-router'
 
@@ -44,12 +49,17 @@ export const Config = z.object({
   rulesFile: z.string(),
   defaultProvider: z.string(),
   defaultModel: z.string(),
+  aliases: z.dict(z.string()),
+  fallbackProvider: z.string(),
+  fallbackModel: z.string(),
   members: z.dict(z.object({ provider: z.string().required(), model: z.string().required() })),
 })
 
 /** Shape rendered by the settings surface; every field is optional. */
 const SettingsSchema = z.object({
   defaults: z.object({ provider: z.string(), model: z.string() }),
+  aliases: z.dict(z.string()),
+  fallback: z.object({ provider: z.string(), model: z.string() }),
   members: z.dict(z.object({ provider: z.string(), model: z.string() })),
 })
 
@@ -105,6 +115,11 @@ function configBaseOf(config) {
   const members = /** @type {Record<string, { provider: string, model: string }> | undefined} */ (config.members)
   if (members !== undefined && members !== null) {
     base.members = Object.fromEntries(Object.entries(members).map(([member, value]) => [member, { provider: value.provider, model: value.model }]))
+  }
+  const aliases = /** @type {Record<string, string> | undefined} */ (config.aliases)
+  if (aliases !== undefined && aliases !== null) base.aliases = { ...aliases }
+  if (typeof config.fallbackProvider === 'string' && typeof config.fallbackModel === 'string') {
+    base.fallback = { provider: config.fallbackProvider, model: config.fallbackModel }
   }
   return base
 }
@@ -164,6 +179,13 @@ function sectionOf(state) {
 }
 
 /**
+ * @param {{ provider: string, model: string } | null | undefined} route
+ */
+function labelRoute(route) {
+  return route === null || route === undefined ? 'unknown' : `${route.provider}/${route.model}`
+}
+
+/**
  * @param {any} agent
  * @param {any} teams
  * @param {import('./lib/rules.js').RuleState} state
@@ -197,7 +219,11 @@ function renderRoster(agent, teams, state, path, diagnostics, runtime) {
         `- ${member.name} [${member.status}] observed=${observed === null ? 'unknown' : `${observed.provider}/${observed.model}`}`
         + ` expected=${describeRoute(expected)} source=${matched !== null ? `rule:${matched.name}` : state.defaults !== null ? 'default' : 'inherit'}`
         + ` ${status === 'stale' ? 'STALE' : status}`
-        + describeOverride(override),
+        + describeOverride(override)
+        + (override !== undefined && expected !== null
+          && (override.selection.provider !== expected.provider || override.selection.model !== expected.model)
+          ? ` CONFLICT: override ${labelRoute(override.selection)} wins over ${matched !== null ? `rule:${matched.name}` : 'the inherited route'}`
+          : ''),
       )
     }
     if (runtime.book.size() > 0 || runtime.pendingByName.size > 0) {
@@ -226,12 +252,18 @@ export async function apply(ctx, config = {}) {
   const pendingByName = new Map()
   const diagnostics = []
 
+  const dir = dirname(path)
+  const sessionStore = createSessionStore(join(dir, 'sessions.json'))
+  const audit = createAuditLog(join(dir, 'audit.jsonl'))
+  const catalog = createCatalog(ctx.get('llm'))
+
   let state
   let settingsScope = null
 
   const loaded = await loadState(config, path)
   state = loaded.state
   diagnostics.push(...loaded.diagnostics)
+  diagnostics.push(...await sessionStore.load())
 
   // Settings are the canonical long-term store when the host mounts them;
   // rules.json stays the fallback and is imported once.
@@ -278,6 +310,49 @@ export async function apply(ctx, config = {}) {
     const reloaded = await loadState(config, path)
     state = reloaded.state
     return reloaded.diagnostics
+  }
+
+  /**
+   * Aliases and the fallback route come from the live settings card when it is
+   * mounted, otherwise from static config. Both are presentation-level: they
+   * never bypass route validation.
+   */
+  function readExtras() {
+    const raw = settingsScope !== null ? settingsScope.get() : config
+    const aliasSource = /** @type {any} */ (raw)?.aliases
+    const normalizedAliases = normalizeAliases(aliasSource)
+    const rawFallback = /** @type {any} */ (raw)?.fallback
+    const fallbackSource = rawFallback !== undefined && rawFallback !== null
+      ? rawFallback
+      : { provider: /** @type {any} */ (config).fallbackProvider, model: /** @type {any} */ (config).fallbackModel }
+    const fallback = normalizeRoute(fallbackSource, 'fallback').route
+    return { aliases: normalizedAliases.aliases, fallback, diagnostics: normalizedAliases.diagnostics }
+  }
+
+  /** Conversation key for persisted overrides: the Team Lead's session. */
+  function sessionKeyOf(agent) {
+    return String(agent?.session?.id ?? '')
+  }
+
+  /** Where a resumed teammate looks for its conversation's overrides. */
+  function resumeKeyOf(agent) {
+    return String(agent?.session?.meta?.parentSession ?? '') || String(agent?.session?.id ?? '')
+  }
+
+  /**
+   * @param {Record<string, unknown>} entry
+   */
+  async function record(entry) {
+    const diagnostic = await audit.append(entry)
+    if (diagnostic !== '') diagnostics.push(diagnostic)
+    return diagnostic
+  }
+
+  /**
+   * @param {{ provider: string, model: string } | null} route
+   */
+  function routeLabel(route) {
+    return labelRoute(route)
   }
 
   const resolve = (/** @type {{ parentId: string, label: string, name: string }} */ target) => {
@@ -340,7 +415,18 @@ export async function apply(ctx, config = {}) {
       return
     }
     if (event?.type === 'turn/end') {
-      if (book.onTurnEnd(id)) applySelection(id, undefined)
+      if (!book.onTurnEnd(id)) return
+      applySelection(id, undefined)
+      const agents = ctx.get('agents')
+      const agent = typeof agents?.get === 'function' ? agents.get(id) : undefined
+      const membership = typeof teams?.tryMembership === 'function' ? teams.tryMembership(agent) : undefined
+      const memberName = typeof membership?.name === 'string' ? membership.name : ''
+      if (memberName === '') return
+      // A one-task override is finished; sticky entries stay on disk until cleared.
+      const key = resumeKeyOf(agent)
+      void sessionStore.remove(key, memberName).then((diagnostic) => {
+        if (diagnostic !== '') diagnostics.push(diagnostic)
+      })
     }
   }), 'team-model-router: turn-scoped selection')
 
@@ -349,9 +435,20 @@ export async function apply(ctx, config = {}) {
     const membership = typeof teams?.tryMembership === 'function' ? teams.tryMembership(agent) : undefined
     if (membership === undefined || membership === null || membership.role !== 'teammate') return
     const queued = pendingByName.get(membership.name)
-    if (queued === undefined) return
+    // Cold resume: an override persisted for this conversation is re-applied by
+    // its member name, because a resumed teammate gets a fresh agent id.
+    const persisted = sessionStore.get(resumeKeyOf(agent))[membership.name]
+    if (queued === undefined && persisted === undefined) return
     pendingByName.delete(membership.name)
-    book.request(String(agent.id), queued.selection, queued.scope)
+    const entry = queued ?? {
+      selection: {
+        provider: persisted.provider,
+        model: persisted.model,
+        ...(persisted.reasoningEffort === undefined ? {} : { reasoningEffort: persisted.reasoningEffort }),
+      },
+      scope: persisted.scope,
+    }
+    book.request(String(agent.id), entry.selection, entry.scope)
   }), 'team-model-router: resume hand-off')
 
   /**
@@ -359,38 +456,83 @@ export async function apply(ctx, config = {}) {
    * @param {string} member
    * @param {{ provider: string, model: string, reasoningEffort?: string }} selection
    * @param {'next-turn' | 'sticky'} scope
+   * @param {string} sessionKey conversation key (the Team Lead's session id)
    */
-  async function setNextModel(leader, member, selection, scope) {
+  async function setNextModel(leader, member, selection, scope, sessionKey = '') {
     if (member === '') throw new Error('member is required')
+
+    const { fallback } = readExtras()
+    const verdict = await catalog.verify(selection)
+    let effective = selection
+    /** @type {string[]} */
+    const notes = []
+    if (verdict.status === 'unknown-provider') {
+      if (fallback === null) {
+        throw new Error(`${verdict.note}. Configure a fallback route in the settings card, or fix the provider id.`)
+      }
+      effective = {
+        provider: fallback.provider,
+        model: fallback.model,
+        ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+      }
+      notes.push(`fallback: provider "${selection.provider}" is not registered, using ${routeLabel(fallback)}`)
+    } else if (verdict.note !== '') {
+      notes.push(`advisory: ${verdict.note}`)
+    }
+
+    async function remember() {
+      const storeDiagnostic = await sessionStore.set(sessionKey, member, {
+        ...effective,
+        scope,
+        at: new Date().toISOString(),
+      })
+      if (storeDiagnostic !== '') diagnostics.push(storeDiagnostic)
+      await record({
+        action: 'next-model',
+        member,
+        session: sessionKey,
+        actor: String(leader?.id ?? ''),
+        to: routeLabel(effective),
+        scope,
+        ...(notes.length === 0 ? {} : { note: notes.join('; ') }),
+      })
+    }
+
+    const tail = notes.length === 0 ? '' : `\n${notes.join('\n')}`
     const row = findMemberRow(teams, leader, member)
     if (row === null) {
       if (teams === undefined || teams === null) {
-        pendingByName.set(member, { selection, scope })
-        return `Agent Teams unavailable; queued ${selection.provider}/${selection.model} for "${member}".`
+        pendingByName.set(member, { selection: effective, scope })
+        await remember()
+        return `Agent Teams unavailable; queued ${routeLabel(effective)} for "${member}".${tail}`
       }
       throw new Error(`unknown teammate "${member}"; call team_model_list for the exact roster names`)
     }
     const agents = ctx.get('agents')
     const live = typeof agents?.get === 'function' ? agents.get(row.id) : undefined
     if (live === undefined || live === null) {
-      pendingByName.set(member, { selection, scope })
-      return `"${member}" is ${row.status}; queued ${selection.provider}/${selection.model} for its next activation.`
+      pendingByName.set(member, { selection: effective, scope })
+      await remember()
+      return `"${member}" is ${row.status}; queued ${routeLabel(effective)} for its next activation.${tail}`
     }
-    book.request(row.id, selection, scope)
+    book.request(row.id, effective, scope)
     ensureSlot(live)
+    await remember()
     const running = String(live.status) === 'running'
     return [
-      `"${member}" next task -> ${selection.provider}/${selection.model}${selection.reasoningEffort === undefined ? '' : ` (effort ${selection.reasoningEffort})`}`,
+      `"${member}" next task -> ${routeLabel(effective)}${effective.reasoningEffort === undefined ? '' : ` (effort ${effective.reasoningEffort})`}`,
       `scope=${scope}; ${running ? 'member is running, so the switch lands on the following turn' : 'applies when the next turn starts'}`,
-      'a one-task override reverts to the member\'s own route at that turn\'s end',
+      'a one-task override reverts to the member\'s own route at that turn\'s end; it survives a reload through the session store',
+      ...(notes.length === 0 ? [] : notes),
     ].join('\n')
   }
 
   /**
    * @param {any} leader
    * @param {string} member
+   * @param {string} sessionKey
    */
-  function clearNextModel(leader, member) {
+  async function clearNextModel(leader, member, sessionKey = '') {
     if (member === '') throw new Error('member is required')
     pendingByName.delete(member)
     const row = findMemberRow(teams, leader, member)
@@ -398,23 +540,29 @@ export async function apply(ctx, config = {}) {
       book.clear(row.id)
       applySelection(row.id, undefined)
     }
+    const storeDiagnostic = await sessionStore.remove(sessionKey, member)
+    if (storeDiagnostic !== '') diagnostics.push(storeDiagnostic)
+    await record({ action: 'next-model-clear', member, session: sessionKey, actor: String(leader?.id ?? '') })
     return `cleared next-task override for "${member}"`
   }
 
   /**
    * @param {string} member
    * @param {{ provider: string, model: string }} route
+   * @param {any} leader
    */
-  async function setDefaultRoute(member, route) {
+  async function setDefaultRoute(member, route, leader) {
     if (member === ALL_MEMBERS) state.defaults = route
     else state.members[member] = route
     await persist()
+    await record({ action: 'default-set', member, actor: String(leader?.id ?? ''), to: routeLabel(route) })
   }
 
   /**
    * @param {string} member
+   * @param {any} leader
    */
-  async function clearDefaultRoute(member) {
+  async function clearDefaultRoute(member, leader) {
     if (member === 'all') {
       state = { version: state.version, defaults: null, members: {} }
     } else if (member === ALL_MEMBERS) {
@@ -423,6 +571,7 @@ export async function apply(ctx, config = {}) {
       delete state.members[member]
     }
     await persist()
+    await record({ action: 'default-clear', member, actor: String(leader?.id ?? '') })
   }
 
   /** @type {Array<() => void>} */
@@ -449,7 +598,7 @@ export async function apply(ctx, config = {}) {
       const member = String(args.member ?? '').trim()
       const normalized = normalizeRoute({ provider: args.provider, model: args.model }, 'arguments')
       if (normalized.route === null) throw new Error(`invalid route: ${normalized.diagnostics.join('; ') || 'provider and model are required'}`)
-      await setDefaultRoute(member, normalized.route)
+      await setDefaultRoute(member, normalized.route, agent)
       return [
         `${member === ALL_MEMBERS ? 'default route' : `member "${member}"`}: ${normalized.route.provider}/${normalized.route.model} saved`,
         `leader route: ${describeRoute(leaderRouteOf(agent))}`,
@@ -490,7 +639,7 @@ export async function apply(ctx, config = {}) {
           ? { reasoningEffort: args.reasoning_effort.trim() }
           : {}),
       }
-      return setNextModel(leader, member, selection, scope)
+      return setNextModel(leader, member, selection, scope, sessionKeyOf(leader))
     },
   })
 
@@ -503,7 +652,7 @@ export async function apply(ctx, config = {}) {
     output: { schema: { type: 'string' } },
     async execute(/** @type {any} */ args, /** @type {any} */ exec) {
       const leader = requireLead(exec, teams)
-      return clearNextModel(leader, String(args.member ?? '').trim())
+      return await clearNextModel(leader, String(args.member ?? '').trim(), sessionKeyOf(leader))
     },
   })
 
@@ -517,7 +666,7 @@ export async function apply(ctx, config = {}) {
     async execute(/** @type {any} */ args, /** @type {any} */ exec) {
       const agent = requireLead(exec, teams)
       const member = String(args.member ?? '').trim()
-      await clearDefaultRoute(member)
+      await clearDefaultRoute(member, agent)
       return `cleared ${member}; leader route stays ${describeRoute(leaderRouteOf(agent))}`
     },
   })
@@ -548,13 +697,59 @@ export async function apply(ctx, config = {}) {
     },
   })
 
+  function renderHealth(agent) {
+    const extras = readExtras()
+    const commandsService = ctx.get('commands')
+    const leader = leaderRouteOf(agent)
+    const known = catalog.providers()
+    const lines = [
+      'health:',
+      `- settings namespace: ${settingsScope === null ? 'NOT mounted (rules.json fallback)' : `mounted (${SETTINGS_NAMESPACE})`}`,
+      `- command plane: ${typeof commandsService?.register === 'function' ? 'mounted (slash command available)' : 'NOT mounted (slash command absent in this profile)'}`,
+      `- llm service: ${catalog.available() ? `mounted, ${known.length} provider(s): ${known.map((entry) => entry.id).join(', ') || '(none)'}` : 'NOT mounted (catalog and validation disabled)'}`,
+      `- agent teams: ${typeof teams?.listMembers === 'function' ? 'mounted' : 'NOT mounted'}`,
+      `- installModelSelection: ${typeof installModelSelection === 'function' ? 'available' : 'MISSING (per-task switching will fail)'}`,
+      `- aliases: ${Object.keys(extras.aliases).length === 0 ? 'none' : Object.entries(extras.aliases).map(([key, value]) => `${key}=${value.provider}/${value.model}`).join(', ')}`,
+      `- fallback route: ${labelRoute(extras.fallback)}`,
+      `- persisted overrides: ${sessionStore.count()} (${sessionStore.path})`,
+      `- audit log: ${audit.path}`,
+    ]
+    const members = typeof teams?.listMembers === 'function' ? teams.listMembers(agent) : []
+    if (members.length > 0) {
+      /** @type {string[]} */
+      const stale = []
+      for (const member of members) {
+        if (member.role === 'lead') continue
+        const expected = matchRule(state, member.name)?.route ?? state.defaults ?? leader
+        if (routeState(member, expected) === 'stale') stale.push(member.name)
+      }
+      lines.push(`- stale members (default route changed but the agent still holds the old snapshot): ${stale.length === 0 ? 'none' : stale.join(', ')}`)
+    }
+    for (const diagnostic of [...diagnostics, ...extras.diagnostics]) lines.push(`- diagnostic: ${diagnostic}`)
+    return lines.join('\n')
+  }
+
+  function routeFromInput(parsed) {
+    const { aliases } = readExtras()
+    if (typeof parsed.token === 'string' && parsed.token !== '') {
+      const resolved = resolveToken(parsed.token, aliases)
+      if (resolved === null) {
+        throw new Error(`unknown model "${parsed.token}": pass "provider model", or add an alias (see /team-model aliases)`)
+      }
+      return resolved
+    }
+    const normalized = normalizeRoute({ provider: parsed.provider, model: parsed.model }, 'command')
+    if (normalized.route === null) throw new Error(normalized.diagnostics.join('; ') || 'provider and model are required')
+    return normalized.route
+  }
+
   // --- human command plane ------------------------------------------------
   const commands = ctx.get('commands')
   if (typeof commands?.register === 'function') {
     ctx.effect(() => commands.register({
       name: COMMAND_NAME,
       description: 'Set one teammate\'s model for its next task in this conversation, or manage member default routes.',
-      input: { hint: 'coder deepseek deepseek-v4 | coder sticky qwen qwen3-coder | coder clear | status' },
+      input: { hint: 'coder deepseek deepseek-v4 | coder sticky qwen qwen3-coder | coder clear | status | models | health' },
       handler: async (/** @type {any} */ invocation) => {
         const agent = invocation.agent
         if (!isLead(agent, teams)) {
@@ -567,25 +762,55 @@ export async function apply(ctx, config = {}) {
               return { kind: 'success', text: renderRoster(agent, teams, state, path, diagnostics, { book, pendingByName }) }
             case 'help':
               return { kind: 'success', text: renderCommandHelp() }
+            case 'models': {
+              if (parsed.provider === undefined) return { kind: 'success', text: await catalog.describe() }
+              const known = catalog.providers()
+              if (!known.some((entry) => entry.id === parsed.provider)) {
+                return { kind: 'error', text: `provider "${parsed.provider}" is not registered; known: ${known.map((entry) => entry.id).join(', ') || '(none)'}` }
+              }
+              const listed = await catalog.models(parsed.provider)
+              if (listed.diagnostic !== '') return { kind: 'error', text: listed.diagnostic }
+              return {
+                kind: 'success',
+                text: listed.models.length === 0
+                  ? `${parsed.provider}: no catalog advertised (any model id is passed through)`
+                  : listed.models.map((model) => `- ${model.id}${model.name === model.id ? '' : `  (${model.name})`}`).join('\n'),
+              }
+            }
+            case 'aliases': {
+              const { aliases, diagnostics: aliasDiagnostics } = readExtras()
+              const names = Object.keys(aliases)
+              return {
+                kind: 'success',
+                text: names.length === 0
+                  ? 'no aliases configured; set them in the settings card (aliases: { v4: "deepseek/deepseek-v4" })'
+                  : names.map((name) => `${name} => ${aliases[name].provider}/${aliases[name].model}`).join('\n')
+                    + (aliasDiagnostics.length === 0 ? '' : `\n${aliasDiagnostics.join('\n')}`),
+              }
+            }
+            case 'log': {
+              const { lines, diagnostics: logDiagnostics } = await audit.tail(parsed.limit ?? 20)
+              return { kind: 'success', text: lines.length === 0 ? '(no audit entries yet)' : lines.join('\n') + (logDiagnostics.length === 0 ? '' : `\n${logDiagnostics.join('\n')}`) }
+            }
+            case 'health':
+              return { kind: 'success', text: renderHealth(agent) }
             case 'set': {
-              const normalized = normalizeRoute({ provider: parsed.provider, model: parsed.model }, 'command')
-              if (normalized.route === null) throw new Error(normalized.diagnostics.join('; ') || 'provider and model are required')
+              const route = routeFromInput(parsed)
               const selection = {
-                ...normalized.route,
+                ...route,
                 ...(parsed.effort === undefined ? {} : { reasoningEffort: parsed.effort }),
               }
-              return { kind: 'success', text: await setNextModel(agent, parsed.member, selection, parsed.scope) }
+              return { kind: 'success', text: await setNextModel(agent, parsed.member, selection, parsed.scope, sessionKeyOf(agent)) }
             }
             case 'clear':
-              return { kind: 'success', text: clearNextModel(agent, parsed.member) }
+              return { kind: 'success', text: await clearNextModel(agent, parsed.member, sessionKeyOf(agent)) }
             case 'set-default': {
-              const normalized = normalizeRoute({ provider: parsed.provider, model: parsed.model }, 'command')
-              if (normalized.route === null) throw new Error(normalized.diagnostics.join('; ') || 'provider and model are required')
-              await setDefaultRoute(parsed.member, normalized.route)
-              return { kind: 'success', text: `默认路由已保存：${parsed.member} => ${normalized.route.provider}/${normalized.route.model}（需重建成员生效）` }
+              const route = routeFromInput(parsed)
+              await setDefaultRoute(parsed.member, route, agent)
+              return { kind: 'success', text: `默认路由已保存：${parsed.member} => ${route.provider}/${route.model}（需重建成员生效）` }
             }
             case 'clear-default':
-              await clearDefaultRoute(parsed.member)
+              await clearDefaultRoute(parsed.member, agent)
               return { kind: 'success', text: `已清除默认路由：${parsed.member}` }
             default:
               return { kind: 'error', text: parsed.text ?? '无法解析该命令' }
