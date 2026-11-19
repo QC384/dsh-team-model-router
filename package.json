@@ -1,0 +1,46 @@
+{
+  "name": "dsh-team-model-router",
+  "version": "0.2.0",
+  "description": "Per-member default routes AND per-task model switching for DSH Agent Teams, without re-creating teammates.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-teams",
+    "subagent",
+    "model-routing"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.1",
+    "@deepseek-ai/dsh-subagent": ">=0.1.1",
+    "@deepseek-ai/schemastery": ">=3.18.0",
+    "@deepseek-ai/dsh-agent": ">=0.1.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "MIT"
+}
