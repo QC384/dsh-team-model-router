@@ -137,7 +137,7 @@ lib/pending.js      spawnTeammate → startContinuable 的一次性交棒（默�
 lib/patch.js        startContinuable / start / spawnTeammate 的可逆包裹
 lib/rules.js        路由校验、通配匹配、优先级、STALE 判定
 lib/store.js        $DSH_HOME 原子读写
-test/               22 个 node:test 用例
+test/               23 个 node:test 用例
 ```
 
 下一单换模型走的是：
@@ -155,10 +155,10 @@ ref.current = undefined                               // turn/end
 ## 8. 验证
 
 ```bash
-npm test        # 22 passed
+npm test        # 23 passed
 ```
 
-覆盖：next-turn 生效/还原、mid-turn 排队不改当前任务、sticky 保留、冷恢复交接、成员隔离、路由成对校验、通配匹配、文件原子读写。
+覆盖：next-turn 生效/还原、mid-turn 排队不改当前任务、sticky 保留、冷恢复交接、成员隔离、路由成对校验、`*` / `?` 通配匹配、文件原子读写。
 
 另外做过一次桩集成冒烟（`installModelSelection` + `session/event` + `agent/created` 全部打桩）：6 个工具注册、turn/start 设值、turn/end 还原、running 排队、inactive 冷恢复、roster 显示 override、非 Lead 拒绝，全部通过。
 
